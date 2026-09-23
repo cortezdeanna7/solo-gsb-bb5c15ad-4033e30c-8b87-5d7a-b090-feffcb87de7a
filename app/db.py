@@ -137,6 +137,62 @@ CREATE INDEX IF NOT EXISTS idx_gws_members_snapshot
     ON group_window_snapshot_members (snapshot_id, position);
 
 -- 审计表只允许 INSERT：任何 UPDATE/DELETE 直接中止，保证历史快照不可变。
+-- 设备级高值告警：规则（触发/恢复阈值）与运行状态存于同一行，随规则写入与状态转换持久化。
+-- recovery_threshold 必须严格小于 trigger_threshold，二者之间为迟滞区，落入该区保持原状态。
+CREATE TABLE IF NOT EXISTS device_alarms (
+    device_id               TEXT PRIMARY KEY,
+    trigger_threshold       REAL NOT NULL,
+    recovery_threshold      REAL NOT NULL,
+    state                   TEXT NOT NULL DEFAULT 'normal'
+                            CHECK (state IN ('normal', 'alarm')),
+    rule_version            INTEGER NOT NULL DEFAULT 1,   -- 每次成功写入规则 +1
+    transition_count        INTEGER NOT NULL DEFAULT 0,   -- 历史状态转换总次数（仅追加、不回退）
+    active_alarm_event_id   TEXT,                         -- 当前告警首发事件（state=alarm 时非空）
+    active_alarm_event_time REAL,
+    active_alarm_value      REAL,
+    active_alarm_started_at TEXT,
+    last_transition         TEXT,                         -- fired | cleared；规则重置后为 NULL
+    last_event_id           TEXT,
+    last_event_time         REAL,
+    last_value              REAL,
+    last_transition_at      TEXT,
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL,
+    CHECK (recovery_threshold < trigger_threshold),
+    FOREIGN KEY (device_id) REFERENCES devices (device_id)
+);
+
+-- 告警状态转换流水：仅在状态真正翻转（normal→alarm / alarm→normal）的同一事务追加一条，
+-- 记录转换时生效的阈值与规则版本，append-only、永不更新或删除。
+CREATE TABLE IF NOT EXISTS device_alarm_events (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id          TEXT NOT NULL,
+    event_id           TEXT NOT NULL,
+    event_time         REAL NOT NULL,
+    value              REAL NOT NULL,
+    transition         TEXT NOT NULL CHECK (transition IN ('fired', 'cleared')),
+    trigger_threshold  REAL NOT NULL,
+    recovery_threshold REAL NOT NULL,
+    rule_version       INTEGER NOT NULL,
+    created_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_alarm_events_device
+    ON device_alarm_events (device_id, id);
+
+-- 告警流水只允许 INSERT：任何 UPDATE/DELETE 直接中止，保证转换历史不可变。
+CREATE TRIGGER IF NOT EXISTS trg_dae_no_update
+BEFORE UPDATE ON device_alarm_events
+BEGIN
+    SELECT RAISE(ABORT, 'device_alarm_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dae_no_delete
+BEFORE DELETE ON device_alarm_events
+BEGIN
+    SELECT RAISE(ABORT, 'device_alarm_events is append-only');
+END;
+
 CREATE TRIGGER IF NOT EXISTS trg_gws_no_update
 BEFORE UPDATE ON group_window_snapshots
 BEGIN

@@ -20,4 +20,8 @@ ENV TELEMETRY_DB_PATH=/data/telemetry.db
 
 EXPOSE 8000
 
+# 镜像自带健康检查（仅依赖镜像内 Python，无需 curl/wget）；compose 可在其上覆盖间隔参数
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
+    CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)"
+
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

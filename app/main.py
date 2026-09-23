@@ -57,6 +57,18 @@
   不会进入本次遍历，因此新增数据既不会在翻页中重复出现也不会挤掉/插入造成遗漏
   （不带游标重新发起检索即可看到新增数据）。
 - 游标签名非法、载荷损坏、已过期，或与本次请求的筛选条件不一致，一律返回 400。
+
+设备级高值告警（迟滞阈值状态机）：
+- PUT /devices/{device_id}/alarm 设置规则：trigger_threshold 为触发阈值，
+  recovery_threshold 为恢复阈值，二者必须为有限数且 recovery < trigger，否则返回 400
+  且**绝不覆盖旧规则**（旧规则与旧状态原样保留）；每次成功写入规则 rule_version 加一，
+  状态重置为 normal（规则语义改变后旧的告警状态不再适用；append-only 转换历史保留）。
+- 状态转换由**事件值**在 ingest 写事务内驱动：normal 下 value >= trigger 首次进入 alarm；
+  alarm 下 value <= recovery 才解除恢复 normal；recovery < value < trigger 的中间区间
+  保持原状态，避免阈值附近反复抖动。转换只在状态真正翻转时发生一次，同事务追加一条不可变流水。
+- 重复 (device_id, event_id) 在求值前去重跳过，因此批次重试/重复上报**绝不重复产生状态变化**。
+- GET /devices/{device_id}/alarm 查询当前规则、状态、当前告警首发事件与最近一次转换；
+  GET /devices/{device_id}/alarm/events 查询追加式转换流水；均持久化，重启不丢失。
 """
 
 from __future__ import annotations
@@ -100,7 +112,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.5.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.6.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
@@ -290,6 +302,53 @@ class RevisionDiffOut(BaseModel):
     members: list[RevisionMemberDeltaOut]  # 仅含发生变化的成员，按成员顺序排列
 
 
+# ---------- 设备级高值告警模型 ----------
+
+class AlarmRuleIn(BaseModel):
+    # 触发阈值：normal 状态下事件值首次 >= 该值进入 alarm
+    trigger_threshold: float
+    # 恢复阈值：alarm 状态下事件值 <= 该值才解除；必须严格小于 trigger_threshold
+    recovery_threshold: float
+
+
+class ActiveAlarmOut(BaseModel):
+    # 进入当前告警状态的首发事件（仅首次越过触发线的事件；之后的高值不更新）
+    event_id: str
+    event_time: datetime
+    value: float
+    started_at: datetime
+
+
+class AlarmStateOut(BaseModel):
+    device_id: str
+    configured: bool  # 是否设置过规则；False 时阈值为 null、state 固定 normal
+    trigger_threshold: Optional[float] = None
+    recovery_threshold: Optional[float] = None
+    state: Literal["normal", "alarm"]
+    rule_version: int
+    transition_count: int
+    active_alarm: Optional[ActiveAlarmOut] = None  # state=alarm 时为首发事件，normal 时为 null
+    last_transition: Optional[Literal["fired", "cleared"]] = None
+    last_event_id: Optional[str] = None
+    last_event_time: Optional[datetime] = None
+    last_value: Optional[float] = None
+    last_transition_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class AlarmTransitionOut(BaseModel):
+    id: int
+    device_id: str
+    event_id: str
+    event_time: datetime
+    value: float
+    transition: Literal["fired", "cleared"]
+    trigger_threshold: float
+    recovery_threshold: float
+    rule_version: int
+    created_at: datetime
+
+
 # ---------- 工具函数 ----------
 
 def to_epoch(dt: datetime) -> float:
@@ -416,6 +475,118 @@ def get_device_labels(conn: sqlite3.Connection, device_id: str) -> dict[str, str
         (device_id,),
     ).fetchall()
     return {r["label_key"]: r["label_value"] for r in rows}
+
+
+# ---------- 设备级高值告警 ----------
+
+def load_alarm_state(conn: sqlite3.Connection, device_id: str) -> Optional[dict[str, Any]]:
+    """读取设备告警规则与当前状态；未设置规则返回 None。
+
+    ingest 循环开始前读取一次：SQLite 写事务在整个批次期间独占写锁，
+    规则不会在批次处理中途被其他写事务改掉，故批次内复用同一份可变状态即可。
+    """
+    row = conn.execute(
+        "SELECT * FROM device_alarms WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def apply_alarm_transition(
+    conn: sqlite3.Connection,
+    alarm: dict[str, Any],
+    *,
+    device_id: str,
+    event_id: str,
+    t: float,
+    value: float,
+    now: str,
+) -> None:
+    """按迟滞阈值状态机对单个**已去重**事件求值，必要时在当前事务内翻转状态。
+
+    - normal 且 value >= trigger_threshold → fired，进入 alarm；
+    - alarm 且 value <= recovery_threshold → cleared，恢复 normal；
+    - 中间区间（recovery < value < trigger）与同态区间保持原状态，不产生任何写入。
+
+    转换为带 state 守卫的条件 UPDATE：仅当数据库中当前状态仍是预期状态时才生效，
+    并以 cursor.rowcount == 1 作为“本次调用真正完成翻转”的唯一判据。重复批次的事件
+    在调用前已被 (device_id, event_id) 幂等去重跳过，即使进入这里条件 UPDATE 也会因
+    状态已推进而落空，因此**批次重试绝不会重复产生状态变化或重复流水**。
+    """
+    trigger = alarm["trigger_threshold"]
+    recovery = alarm["recovery_threshold"]
+    state = alarm["state"]
+
+    if state == "normal" and value >= trigger:
+        cur = conn.execute(
+            "UPDATE device_alarms SET state = 'alarm', transition_count = transition_count + 1,"
+            " active_alarm_event_id = ?, active_alarm_event_time = ?, active_alarm_value = ?,"
+            " active_alarm_started_at = ?, last_transition = 'fired', last_event_id = ?,"
+            " last_event_time = ?, last_value = ?, last_transition_at = ?, updated_at = ?"
+            " WHERE device_id = ? AND state = 'normal'",
+            (event_id, t, value, now, event_id, t, value, now, now, device_id),
+        )
+        if cur.rowcount == 1:
+            conn.execute(
+                "INSERT INTO device_alarm_events (device_id, event_id, event_time, value, transition,"
+                " trigger_threshold, recovery_threshold, rule_version, created_at)"
+                " VALUES (?, ?, ?, ?, 'fired', ?, ?, ?, ?)",
+                (device_id, event_id, t, value, trigger, recovery, alarm["rule_version"], now),
+            )
+            alarm["state"] = "alarm"
+            alarm["transition_count"] += 1
+    elif state == "alarm" and value <= recovery:
+        cur = conn.execute(
+            "UPDATE device_alarms SET state = 'normal', transition_count = transition_count + 1,"
+            " active_alarm_event_id = NULL, active_alarm_event_time = NULL, active_alarm_value = NULL,"
+            " active_alarm_started_at = NULL, last_transition = 'cleared', last_event_id = ?,"
+            " last_event_time = ?, last_value = ?, last_transition_at = ?, updated_at = ?"
+            " WHERE device_id = ? AND state = 'alarm'",
+            (event_id, t, value, now, now, device_id),
+        )
+        if cur.rowcount == 1:
+            conn.execute(
+                "INSERT INTO device_alarm_events (device_id, event_id, event_time, value, transition,"
+                " trigger_threshold, recovery_threshold, rule_version, created_at)"
+                " VALUES (?, ?, ?, ?, 'cleared', ?, ?, ?, ?)",
+                (device_id, event_id, t, value, trigger, recovery, alarm["rule_version"], now),
+            )
+            alarm["state"] = "normal"
+            alarm["transition_count"] += 1
+
+
+def alarm_row_to_out(device_id: str, r: Optional[sqlite3.Row]) -> AlarmStateOut:
+    if r is None:
+        return AlarmStateOut(
+            device_id=device_id,
+            configured=False,
+            state="normal",
+            rule_version=0,
+            transition_count=0,
+        )
+    active = None
+    if r["state"] == "alarm" and r["active_alarm_event_id"] is not None:
+        active = ActiveAlarmOut(
+            event_id=r["active_alarm_event_id"],
+            event_time=to_iso(r["active_alarm_event_time"]),
+            value=r["active_alarm_value"],
+            started_at=r["active_alarm_started_at"],
+        )
+    return AlarmStateOut(
+        device_id=device_id,
+        configured=True,
+        trigger_threshold=r["trigger_threshold"],
+        recovery_threshold=r["recovery_threshold"],
+        state=r["state"],
+        rule_version=r["rule_version"],
+        transition_count=r["transition_count"],
+        active_alarm=active,
+        last_transition=r["last_transition"],
+        last_event_id=r["last_event_id"],
+        last_event_time=to_iso(r["last_event_time"]),
+        last_value=r["last_value"],
+        last_transition_at=r["last_transition_at"],
+        updated_at=r["updated_at"],
+    )
 
 
 def window_row_to_out(r: sqlite3.Row) -> WindowOut:
@@ -797,6 +968,8 @@ def ingest(req: IngestRequest) -> IngestResponse:
         watermark = dev["watermark"]
         size = dev["window_size_seconds"]
         lateness = dev["allowed_lateness_seconds"]
+        # 告警规则与状态在批次开始前读取一次；未配置告警的设备 None，事件不参与告警求值
+        alarm = load_alarm_state(conn, req.device_id)
 
         for ev in req.events:
             t = to_epoch(ev.event_time)
@@ -850,6 +1023,15 @@ def ingest(req: IngestRequest) -> IngestResponse:
 
             if watermark is None or t > watermark:
                 watermark = t
+
+            # 高值告警：按事件值驱动迟滞状态机；重复事件已在上方 continue 跳过，
+            # 批次重试不会再次求值、更不会重复翻转状态
+            if alarm is not None:
+                apply_alarm_transition(
+                    conn, alarm, device_id=req.device_id,
+                    event_id=ev.event_id, t=t, value=ev.value, now=now,
+                )
+
             results.append(EventResult(event_id=ev.event_id, status=status, window_start=to_iso(w_start)))
 
         # 持久化水位线，并封存所有越过允许迟到窗口的窗口
@@ -1049,8 +1231,112 @@ def list_corrections(device_id: str) -> list[CorrectionOut]:
         ]
 
 
-# ---------- 跨设备窗口检索接口 ----------
+# ---------- 设备级高值告警接口 ----------
 
+@app.put("/devices/{device_id}/alarm", response_model=AlarmStateOut)
+def put_device_alarm(device_id: str, req: AlarmRuleIn) -> AlarmStateOut:
+    """设置设备高值告警规则（触发阈值 + 较低的恢复阈值）。
+
+    recovery_threshold 必须严格小于 trigger_threshold，且二者都必须是有限数（拒绝 NaN/Infinity）。
+    校验失败返回 400 且**绝不覆盖旧规则**：旧阈值与旧运行状态（state、当前告警、最近转换）
+    原样保留。每次成功写入 rule_version 加一；新规则语义改变后旧的告警状态不再适用，
+    状态重置为 normal、清除当前告警首发事件（历史转换流水 append-only 保留，
+    transition_count 累计不回退）。设备不存在返回 404。
+    """
+    trigger = req.trigger_threshold
+    recovery = req.recovery_threshold
+    if not math.isfinite(trigger) or not math.isfinite(recovery):
+        raise HTTPException(
+            status_code=400,
+            detail="trigger_threshold and recovery_threshold must be finite numbers",
+        )
+    if recovery >= trigger:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"recovery_threshold ({recovery}) must be strictly lower than "
+                f"trigger_threshold ({trigger}); the gap between them is the hysteresis band"
+            ),
+        )
+
+    now = utcnow_iso()
+    with db.session() as conn:
+        require_device(conn, device_id)
+        existing = conn.execute(
+            "SELECT * FROM device_alarms WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO device_alarms (device_id, trigger_threshold, recovery_threshold,"
+                " state, rule_version, transition_count, created_at, updated_at)"
+                " VALUES (?, ?, ?, 'normal', 1, 0, ?, ?)",
+                (device_id, trigger, recovery, now, now),
+            )
+        else:
+            # 新规则即新状态机：重置运行状态，但累计转换次数（历史长度）保留不回退
+            conn.execute(
+                "UPDATE device_alarms SET trigger_threshold = ?, recovery_threshold = ?,"
+                " state = 'normal', rule_version = rule_version + 1,"
+                " active_alarm_event_id = NULL, active_alarm_event_time = NULL,"
+                " active_alarm_value = NULL, active_alarm_started_at = NULL,"
+                " last_transition = NULL, last_event_id = NULL, last_event_time = NULL,"
+                " last_value = NULL, last_transition_at = NULL, updated_at = ?"
+                " WHERE device_id = ?",
+                (trigger, recovery, now, device_id),
+            )
+        row = conn.execute(
+            "SELECT * FROM device_alarms WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        return alarm_row_to_out(device_id, row)
+
+
+@app.get("/devices/{device_id}/alarm", response_model=AlarmStateOut)
+def get_device_alarm(device_id: str) -> AlarmStateOut:
+    """查询设备当前告警规则与状态。
+
+    设备存在但从未设置规则时返回 configured=false、阈值为 null、state=normal、rule_version=0；
+    设备不存在返回 404。state=alarm 时 active_alarm 给出**首次**越过触发线的事件
+    （之后的高值不覆盖），解除后为 null。
+    """
+    with db.session() as conn:
+        require_device(conn, device_id)
+        row = conn.execute(
+            "SELECT * FROM device_alarms WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        return alarm_row_to_out(device_id, row)
+
+
+@app.get("/devices/{device_id}/alarm/events", response_model=list[AlarmTransitionOut])
+def list_device_alarm_events(device_id: str) -> list[AlarmTransitionOut]:
+    """返回设备告警状态转换流水（append-only），按发生顺序升序。
+
+    仅包含真正的状态翻转（fired/cleared），每条记录转换时生效的阈值与规则版本；
+    重复上报与批次重试不会产生重复流水。设备不存在返回 404，从未配置告警返回 []。
+    """
+    with db.session() as conn:
+        require_device(conn, device_id)
+        rows = conn.execute(
+            "SELECT * FROM device_alarm_events WHERE device_id = ? ORDER BY id",
+            (device_id,),
+        ).fetchall()
+        return [
+            AlarmTransitionOut(
+                id=r["id"],
+                device_id=r["device_id"],
+                event_id=r["event_id"],
+                event_time=to_iso(r["event_time"]),
+                value=r["value"],
+                transition=r["transition"],
+                trigger_threshold=r["trigger_threshold"],
+                recovery_threshold=r["recovery_threshold"],
+                rule_version=r["rule_version"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+
+# ---------- 跨设备窗口检索接口 ----------
 @app.get("/windows/search", response_model=WindowSearchResponse)
 def search_windows(
     start: Optional[datetime] = Query(

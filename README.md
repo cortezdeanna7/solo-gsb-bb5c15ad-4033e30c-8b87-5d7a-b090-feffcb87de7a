@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）与**跨设备窗口检索**（按时间范围、状态与设备标签精确筛选，绑定筛选条件的稳定游标分页）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）、**跨设备窗口检索**（按时间范围、状态与设备标签精确筛选，绑定筛选条件的稳定游标分页）与**设备级高值告警**（触发/恢复双阈值迟滞状态机，事件值驱动、防抖动，规则与状态持久化，批次重试不重复产生状态变化）。
 
 ## 核心语义
 
@@ -59,6 +59,18 @@
   - **新增数据不影响进行中的遍历**：游标锚定首次查询时的稳定集合，翻页期间新写入的窗口（无论时间早晚）都不会进入本次遍历，因此**不会在后续页重复出现，也不会插入或挤出造成遗漏**；需要查看新增数据时不带 `cursor` 重新发起检索即可。
   - 游标被篡改或伪造、载荷损坏、**已过期**、或与当前请求的筛选条件不一致，一律返回 **`400`**，客户端应重新发起无游标检索。
 - **纯只读**：检索不修改任何数据，也不影响现有接口。
+
+### 设备级高值告警（迟滞阈值状态机）
+
+- **规则设置**：`PUT /devices/{id}/alarm` 为设备设置两条阈值——较高的 `trigger_threshold`（触发线）与较低的 `recovery_threshold`（恢复线）。二者必须是有限数且 **`recovery_threshold < trigger_threshold` 严格成立**，否则返回 `400` 且**绝不覆盖旧规则**（旧阈值与旧运行状态原样保留）；设备不存在返回 `404`。每次成功写入都令 `rule_version` 加一。更换规则后旧的告警状态不再适用，状态重置为 `normal`（历史转换流水仍保留，`transition_count` 累计不回退）。
+- **迟滞状态机（防抖动）**：事件写入（`POST /ingest`）时在**同一写事务**内按事件值驱动转换：
+  - `normal` 下，事件值 **`>= trigger_threshold`** 才**首次**进入 `alarm`，记录首发事件；
+  - `alarm` 下，事件值 **`<= recovery_threshold`** 才解除、恢复 `normal`；
+  - 落在两线之间的中间区间（`recovery < value < trigger`）**保持原状态**——告警中不会因一次回落立即解除，正常态也不会因一次小波动误报，从而避免阈值附近反复抖动。解除后再次越线可重新告警。
+- **批次重试幂等**：状态转换只在状态**真正翻转**时发生一次；重复 `(device_id, event_id)` 在求值前即被幂等去重跳过，状态翻转还带有数据库当前状态守卫。因此**同一批次重试/重复上报绝不重复产生状态变化、绝不重复留档**。批次内事件按提交顺序依次求值（同批次内先触发后恢复是允许的）；迟到（`late`）事件与正常事件一样按值驱动。
+- **状态查询**：`GET /devices/{id}/alarm` 返回当前规则、`state`（`normal`/`alarm`）、`rule_version`、累计转换次数、当前告警的**首发事件**（`active_alarm`，含事件 id/时间/值/进入时间；`normal` 时为 `null`）以及最近一次转换信息。设备存在但从未配置规则时返回 `configured=false`、阈值为 `null`、`state=normal`、`rule_version=0`。
+- **转换流水**：`GET /devices/{id}/alarm/events` 返回 append-only 的状态转换流水（`fired`/`cleared`，含转换时生效的阈值与规则版本），按发生顺序排列；流水表带禁止 `UPDATE`/`DELETE` 的数据库触发器。
+- **持久化**：规则、运行状态与流水全部存于 SQLite，服务重启后不丢失，新事件继续按持久化状态驱动。
 
 ## 启动
 
@@ -543,6 +555,69 @@ curl 'http://localhost:8000/windows/search?status=sealed&limit=100&cursor=eyJ2Ij
 - 翻页期间新增的窗口不会进入本次遍历（既不重复也不遗漏）；要看新增数据，不带 `cursor` 重新检索即可。
 - 游标非法、被篡改、过期（默认 1 小时）或与当前筛选条件不一致返回 `400`；`end <= start`、只给 `label_value`、`limit` 越界返回 `422`。
 
+### 17. 设备级高值告警（触发/恢复双阈值）
+
+为设备设置触发阈值 `10` 与恢复阈值 `5`：
+
+```bash
+curl -X PUT http://localhost:8000/devices/sensor-001/alarm \
+  -H 'Content-Type: application/json' \
+  -d '{"trigger_threshold": 10.0, "recovery_threshold": 5.0}'
+```
+
+```json
+{
+  "device_id": "sensor-001",
+  "configured": true,
+  "trigger_threshold": 10.0,
+  "recovery_threshold": 5.0,
+  "state": "normal",
+  "rule_version": 1,
+  "transition_count": 0,
+  "active_alarm": null,
+  "last_transition": null,
+  "last_event_id": null,
+  "last_event_time": null,
+  "last_value": null,
+  "last_transition_at": null,
+  "updated_at": "2026-09-23T09:00:00Z"
+}
+```
+
+随后事件 `7 → 10 → 8 → 5` 的状态机行为：`7` 落在中间区间保持 `normal`；`10`（`>= 10`）首次进入 `alarm`，首发事件被记录；`8` 仍在中间区间，**保持 `alarm` 不抖动**；`5`（`<= 5`）才解除恢复 `normal`：
+
+```bash
+curl -X POST http://localhost:8000/ingest -H 'Content-Type: application/json' -d '{
+  "device_id": "sensor-001",
+  "events": [
+    {"event_id": "a1", "event_time": "2026-09-23T09:00:01Z", "value": 7},
+    {"event_id": "a2", "event_time": "2026-09-23T09:00:02Z", "value": 10},
+    {"event_id": "a3", "event_time": "2026-09-23T09:00:03Z", "value": 8},
+    {"event_id": "a4", "event_time": "2026-09-23T09:00:04Z", "value": 5}
+  ]
+}'
+
+curl http://localhost:8000/devices/sensor-001/alarm
+# state 最终为 "normal"，transition_count=2；a2 之后查询时 state 曾为 "alarm"，
+# active_alarm.event_id="a2"
+curl http://localhost:8000/devices/sensor-001/alarm/events
+```
+
+```json
+[
+  {"id": 1, "device_id": "sensor-001", "event_id": "a2", "event_time": "2026-09-23T09:00:02Z",
+   "value": 10.0, "transition": "fired", "trigger_threshold": 10.0,
+   "recovery_threshold": 5.0, "rule_version": 1, "created_at": "2026-09-23T09:00:05Z"},
+  {"id": 2, "device_id": "sensor-001", "event_id": "a4", "event_time": "2026-09-23T09:00:04Z",
+   "value": 5.0, "transition": "cleared", "trigger_threshold": 10.0,
+   "recovery_threshold": 5.0, "rule_version": 1, "created_at": "2026-09-23T09:00:05Z"}
+]
+```
+
+- 整个批次重复提交时，`a1`~`a4` 全部返回 `duplicate`，`transition_count` 与流水**保持不变**。
+- `recovery_threshold >= trigger_threshold` 或阈值为 `NaN`/`Infinity` 返回 `400`，旧规则与旧状态不受影响；设备不存在返回 `404`。
+- 更换规则后状态重置为 `normal`、`rule_version` 加一；从未配置规则的设备查询返回 `configured=false`、`state=normal`。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -556,6 +631,9 @@ curl 'http://localhost:8000/windows/search?status=sealed&limit=100&cursor=eyJ2Ij
 | `GET` | `/devices/{device_id}/labels` | 设备当前标签与版本（从未写入为 version 0） |
 | `GET` | `/devices/{device_id}/windows` | 各时间窗聚合值、状态、修正次数（支持 `?status=open\|sealed`） |
 | `GET` | `/devices/{device_id}/corrections` | 迟到数据修正记录 |
+| `PUT` | `/devices/{device_id}/alarm` | 设置高值告警规则（触发/恢复双阈值，recovery 必须严格更低，非法返回 400 且不覆盖旧规则；成功则版本 +1、状态重置） |
+| `GET` | `/devices/{device_id}/alarm` | 查询当前告警规则与状态（`normal`/`alarm`、首发事件、最近转换；未配置为 configured=false） |
+| `GET` | `/devices/{device_id}/alarm/events` | 告警状态转换流水（append-only 的 fired/cleared 记录） |
 | `GET` | `/windows/search` | 跨设备窗口检索：按时间范围（`start`/`end` 半开区间）、`status`、设备当前标签筛选，按 window_start、device_id 升序，绑定筛选条件的稳定游标分页（`limit`/`cursor`，非法或过期游标 400） |
 | `GET` | `/devices/{device_id}/anomalies?window_start=&threshold=3.5` | 已封存窗口事件的中位数/MAD 稳健异常检测（只读；窗口不存在 404，未封存 409，threshold≤0 为 422） |
 | `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验） |
@@ -570,8 +648,8 @@ curl 'http://localhost:8000/windows/search?status=sealed&limit=100&cursor=eyJ2Ij
 
 ```
 app/
-  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）逻辑
-  db.py          # SQLite 连接、建表（含标签表、append-only 审计表/触发器）、旧库迁移与事务会话
+  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（迟滞阈值状态机）逻辑
+  db.py          # SQLite 连接、建表（含标签表、append-only 审计/告警流水表与触发器）、旧库迁移与事务会话
 tests/
   test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
   test_labels.py    # 设备标签测试（规范化/重复键/版本递增/乐观并发/标签筛选/旧库迁移）
@@ -579,6 +657,7 @@ tests/
   test_revisions.py # 修订审计测试（快照留档、diff、422/404、不可变性、旧库 baseline 补档）
   test_anomalies.py # 封存窗口稳健异常检测测试（中位数/MAD 打分、MAD=0、404/409/422、只读）
   test_windows_search.py # 跨设备窗口检索测试（时间范围/状态/标签筛选、游标分页稳定性、400/422、只读）
+  test_alarms.py    # 设备级高值告警测试（迟滞状态机、边界、批次内转换、非法阈值不覆盖、重试幂等、持久化、流水 append-only）
 Dockerfile
 docker-compose.yml
 requirements.txt

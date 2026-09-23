@@ -1,6 +1,8 @@
 services:
   api:
     build: .
+    # 单命令可启动：始终从本地 Dockerfile 构建，不依赖预先推送/拉取镜像
+    pull_policy: build
     ports:
       - "8000:8000"
     environment:
@@ -10,6 +12,7 @@ services:
     restart: unless-stopped
     healthcheck:
       # 仅依赖镜像自带的 Python，无需额外安装 curl/wget；失败时 docker ps 显示 unhealthy
+      # （Dockerfile 内已内置同一条检查，这里同时给出以便 compose 调整间隔/重试参数）
       test:
         - CMD
         - python
