@@ -57,6 +57,18 @@
   不会进入本次遍历，因此新增数据既不会在翻页中重复出现也不会挤掉/插入造成遗漏
   （不带游标重新发起检索即可看到新增数据）。
 - 游标签名非法、载荷损坏、已过期，或与本次请求的筛选条件不一致，一律返回 400。
+
+设备级高值告警（双阈值滞回状态机）：
+- PUT /devices/{device_id}/alert-rule 为设备设置触发阈值 trigger_threshold 与较低的恢复阈值
+  recovery_threshold；阈值必须是有限数且 recovery < trigger，任一不合法返回 400 且**不开启写事务、
+  绝不覆盖旧规则**；设备不存在返回 404。
+- GET /devices/{device_id}/alert 查询当前告警状态；设备无规则返回 404（无规则即没有状态机）。
+- 事件写入（含迟到事件）时在与聚合相同的 ingest 事务内逐事件驱动状态转换：
+  value >= 触发线且当前未告警 → 进入告警（首次越线才触发）；
+  value <= 恢复线且当前告警中 → 解除告警；
+  恢复线 < value < 触发线的中间区间保持原状态（滞回，避免阈值附近反复抖动）。
+- 状态与规则持久化在 SQLite 中，重启不丢失；每次转换追加只增流水，
+  (device_id, event_id) 唯一约束兜底——批次重试的重复事件在幂等去重阶段即跳过，不会重复产生状态变化。
 """
 
 from __future__ import annotations
@@ -100,7 +112,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.5.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.6.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
@@ -288,6 +300,36 @@ class RevisionDiffOut(BaseModel):
     to_value: float
     value_delta: float
     members: list[RevisionMemberDeltaOut]  # 仅含发生变化的成员，按成员顺序排列
+
+
+class AlertRuleIn(BaseModel):
+    trigger_threshold: float   # 进入告警的高值触发线
+    recovery_threshold: float  # 解除告警的恢复线，必须严格低于触发线
+
+
+class AlertRuleOut(BaseModel):
+    device_id: str
+    trigger_threshold: float
+    recovery_threshold: float
+    created_at: datetime
+    updated_at: datetime
+
+
+class AlertOut(BaseModel):
+    device_id: str
+    rule: AlertRuleOut
+    # 是否正处于告警中（首次越过触发线后置 true，降至恢复线后回到 false）
+    alerting: bool
+    alarm_count: int
+    recovery_count: int
+    last_value: Optional[float] = None
+    last_event_id: Optional[str] = None
+    last_event_time: Optional[datetime] = None
+    # 最近一次状态转换：entered（进入告警）/ cleared（解除）；规则下尚无任何事件时为 null
+    last_transition: Optional[Literal["entered", "cleared"]] = None
+    entered_at: Optional[datetime] = None
+    cleared_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 # ---------- 工具函数 ----------
@@ -779,6 +821,165 @@ def group_window_out(r: sqlite3.Row) -> GroupWindowOut:
     )
 
 
+# ---------- 设备级高值告警工具 ----------
+
+def validate_alert_thresholds(trigger: float, recovery: float) -> None:
+    """阈值合法性校验：必须是有限数（拒绝 NaN/Inf），且恢复线严格低于触发线。
+
+    校验失败直接 400：调用方在开启任何写事务之前执行，非法请求绝不改动既有规则。
+    """
+    if not math.isfinite(trigger) or not math.isfinite(recovery):
+        raise HTTPException(
+            status_code=400,
+            detail="trigger_threshold and recovery_threshold must be finite numbers",
+        )
+    if recovery >= trigger:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"recovery_threshold ({recovery}) must be strictly lower than"
+                f" trigger_threshold ({trigger})"
+            ),
+        )
+
+
+def get_alert_rule(conn: sqlite3.Connection, device_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM device_alert_rules WHERE device_id = ?", (device_id,)
+    ).fetchone()
+
+
+def alert_rule_to_out(r: sqlite3.Row) -> AlertRuleOut:
+    return AlertRuleOut(
+        device_id=r["device_id"],
+        trigger_threshold=r["trigger_threshold"],
+        recovery_threshold=r["recovery_threshold"],
+        created_at=r["created_at"],
+        updated_at=r["updated_at"],
+    )
+
+
+def get_alert_state(conn: sqlite3.Connection, device_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM device_alert_states WHERE device_id = ?", (device_id,)
+    ).fetchone()
+
+
+def build_alert_out(rule: sqlite3.Row, state: Optional[sqlite3.Row]) -> AlertOut:
+    if state is None:
+        # 已配置规则但尚无事件驱动过状态机：按初始状态返回
+        return AlertOut(
+            device_id=rule["device_id"],
+            rule=alert_rule_to_out(rule),
+            alerting=False,
+            alarm_count=0,
+            recovery_count=0,
+        )
+    return AlertOut(
+        device_id=rule["device_id"],
+        rule=alert_rule_to_out(rule),
+        alerting=bool(state["alerting"]),
+        alarm_count=state["alarm_count"],
+        recovery_count=state["recovery_count"],
+        last_value=state["last_value"],
+        last_event_id=state["last_event_id"],
+        last_event_time=to_iso(state["last_event_time"]),
+        last_transition=state["last_transition"],
+        entered_at=state["entered_at"],
+        cleared_at=state["cleared_at"],
+        updated_at=state["updated_at"],
+    )
+
+
+def apply_alert_state_machine(
+    conn: sqlite3.Connection,
+    rule: sqlite3.Row,
+    device_id: str,
+    event_id: str,
+    event_time: float,
+    value: float,
+    now: str,
+) -> None:
+    """在当前 ingest 事务内逐事件驱动双阈值滞回状态机。
+
+    - value >= trigger_threshold 且当前未告警 → entered（首次越线才进入，
+      告警中再次出现高值不重复触发）；
+    - value <= recovery_threshold 且当前告警中 → cleared（降至恢复线才解除）；
+    - recovery < value < trigger 的中间区间保持原状态（滞回防抖）。
+    重复事件不会到达这里（ingest 侧先做 (device_id, event_id) 幂等去重）；
+    流水表的 (device_id, event_id) 唯一约束是兜底防线。
+    """
+    state = get_alert_state(conn, device_id)
+    currently_alerting = state is not None and bool(state["alerting"])
+
+    if not currently_alerting and value >= rule["trigger_threshold"]:
+        kind = "entered"
+    elif currently_alerting and value <= rule["recovery_threshold"]:
+        kind = "cleared"
+    else:
+        # 中间区间（或同态继续高值/低值）：仅更新最近事件观测，状态保持不变
+        if state is None:
+            conn.execute(
+                "INSERT INTO device_alert_states"
+                " (device_id, alerting, alarm_count, recovery_count, last_value,"
+                "  last_event_id, last_event_time, last_transition, entered_at,"
+                "  cleared_at, updated_at)"
+                " VALUES (?, 0, 0, 0, ?, ?, ?, NULL, NULL, NULL, ?)",
+                (device_id, value, event_id, event_time, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE device_alert_states SET last_value = ?, last_event_id = ?,"
+                " last_event_time = ?, updated_at = ? WHERE device_id = ?",
+                (value, event_id, event_time, now, device_id),
+            )
+        return
+
+    conn.execute(
+        "INSERT INTO device_alert_transitions"
+        " (device_id, event_id, event_time, value, kind, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (device_id, event_id, event_time, value, kind, now),
+    )
+    if state is None:
+        conn.execute(
+            "INSERT INTO device_alert_states"
+            " (device_id, alerting, alarm_count, recovery_count, last_value,"
+            "  last_event_id, last_event_time, last_transition, entered_at,"
+            "  cleared_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                device_id,
+                1 if kind == "entered" else 0,
+                1 if kind == "entered" else 0,
+                1 if kind == "cleared" else 0,
+                value, event_id, event_time, kind,
+                now if kind == "entered" else None,
+                now if kind == "cleared" else None,
+                now,
+            ),
+        )
+    else:
+        conn.execute(
+            "UPDATE device_alert_states SET alerting = ?,"
+            " alarm_count = alarm_count + ?,"
+            " recovery_count = recovery_count + ?,"
+            " last_value = ?, last_event_id = ?, last_event_time = ?,"
+            " last_transition = ?, entered_at = ?, cleared_at = ?, updated_at = ?"
+            " WHERE device_id = ?",
+            (
+                1 if kind == "entered" else 0,
+                1 if kind == "entered" else 0,
+                1 if kind == "cleared" else 0,
+                value, event_id, event_time, kind,
+                now if kind == "entered" else state["entered_at"],
+                now if kind == "cleared" else state["cleared_at"],
+                now,
+                device_id,
+            ),
+        )
+
+
 # ---------- 接口 ----------
 
 @app.get("/health")
@@ -792,11 +993,16 @@ def ingest(req: IngestRequest) -> IngestResponse:
     now = utcnow_iso()
     results: list[EventResult] = []
 
-    with db.session() as conn:
+    # BEGIN IMMEDIATE：ingest 内含告警状态机的读-改-写（以及组汇总对账），
+    # 立即加写锁保证并发批次串行化，避免两个写事务基于同一状态快照而丢失状态变化。
+    with db.immediate_session() as conn:
         dev = get_or_create_device(conn, req.device_id, now)
         watermark = dev["watermark"]
         size = dev["window_size_seconds"]
         lateness = dev["allowed_lateness_seconds"]
+        # 批次开始后规则若被其他事务替换不会发生（写锁串行化）；
+        # 无规则的设备告警状态机不参与本批次处理。
+        alert_rule = get_alert_rule(conn, req.device_id)
 
         for ev in req.events:
             t = to_epoch(ev.event_time)
@@ -846,6 +1052,13 @@ def ingest(req: IngestRequest) -> IngestResponse:
                     "INSERT INTO corrections (device_id, event_id, window_start, event_time, value, created_at)"
                     " VALUES (?, ?, ?, ?, ?, ?)",
                     (req.device_id, ev.event_id, w_start, t, ev.value, now),
+                )
+
+            # 高值告警状态机：与聚合在同一事务内按事件值驱动（迟到事件同样参与，
+            # 因为重试的重复事件在上面的去重分支已 continue，故不会重复产生状态变化）
+            if alert_rule is not None:
+                apply_alert_state_machine(
+                    conn, alert_rule, req.device_id, ev.event_id, t, ev.value, now
                 )
 
             if watermark is None or t > watermark:
@@ -1256,6 +1469,56 @@ def list_device_anomalies(
                     score=score,
                 ))
         return anomalies
+
+
+# ---------- 设备级高值告警接口 ----------
+
+@app.put("/devices/{device_id}/alert-rule", response_model=AlertRuleOut)
+def put_device_alert_rule(device_id: str, req: AlertRuleIn) -> AlertRuleOut:
+    """设置（替换）设备高值告警的双阈值规则。
+
+    触发阈值必须严格高于恢复阈值，且二者都必须是有限数（NaN/Infinity 拒绝）；
+    任一不合法返回 400 且不开启写事务，**旧规则保持原样不被覆盖**。
+    设备不存在返回 404。规则替换本身不触发任何状态转换，既有告警状态保持不变，
+    后续事件按新阈值驱动状态机。
+    """
+    validate_alert_thresholds(req.trigger_threshold, req.recovery_threshold)
+    now = utcnow_iso()
+    with db.session() as conn:
+        require_device(conn, device_id)
+        existing = get_alert_rule(conn, device_id)
+        if existing is None:
+            conn.execute(
+                "INSERT INTO device_alert_rules"
+                " (device_id, trigger_threshold, recovery_threshold, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (device_id, req.trigger_threshold, req.recovery_threshold, now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE device_alert_rules SET trigger_threshold = ?,"
+                " recovery_threshold = ?, updated_at = ? WHERE device_id = ?",
+                (req.trigger_threshold, req.recovery_threshold, now, device_id),
+            )
+        return alert_rule_to_out(get_alert_rule(conn, device_id))
+
+
+@app.get("/devices/{device_id}/alert", response_model=AlertOut)
+def get_device_alert(device_id: str) -> AlertOut:
+    """查询设备当前告警状态与正在生效的规则。
+
+    返回是否告警中（alerting）、累计进入/解除次数、最近驱动事件及最近一次转换时间。
+    设备不存在返回 404；设备存在但从未配置告警规则返回 404（无规则即无状态机）。
+    """
+    with db.session() as conn:
+        require_device(conn, device_id)
+        rule = get_alert_rule(conn, device_id)
+        if rule is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no alert rule configured for device: {device_id}",
+            )
+        return build_alert_out(rule, get_alert_state(conn, device_id))
 
 
 # ---------- 设备组接口 ----------

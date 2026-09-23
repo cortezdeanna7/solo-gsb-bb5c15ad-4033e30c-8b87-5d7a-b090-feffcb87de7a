@@ -160,6 +160,53 @@ BEFORE DELETE ON group_window_snapshot_members
 BEGIN
     SELECT RAISE(ABORT, 'group_window_snapshot_members is append-only');
 END;
+
+-- 设备级高值告警规则：每设备至多一条。trigger_threshold 为触发线（高值），
+-- recovery_threshold 为较低的恢复线；合法性（有限数且 recovery < trigger）在应用层校验，
+-- 非法请求直接 400、不开启写事务，旧规则绝不会被覆盖。
+CREATE TABLE IF NOT EXISTS device_alert_rules (
+    device_id          TEXT PRIMARY KEY,
+    trigger_threshold  REAL NOT NULL,
+    recovery_threshold REAL NOT NULL,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    FOREIGN KEY (device_id) REFERENCES devices (device_id)
+);
+
+-- 设备告警状态机当前状态（持久化）：not_alerting -> alerting -> not_alerting ……
+-- 仅在首次 value >= trigger_threshold 时进入告警（alarm_count +1），
+-- 仅在 value <= recovery_threshold 时解除（recovery_count +1），
+-- 处于两线之间的中间区间时保持原状态，避免阈值附近反复抖动。
+CREATE TABLE IF NOT EXISTS device_alert_states (
+    device_id      TEXT PRIMARY KEY,
+    alerting       INTEGER NOT NULL DEFAULT 0,   -- 1=告警中，0=正常
+    alarm_count    INTEGER NOT NULL DEFAULT 0,  -- 累计进入告警次数（每次首次越线 +1）
+    recovery_count INTEGER NOT NULL DEFAULT 0,  -- 累计解除告警次数
+    last_value     REAL,                        -- 最近一个驱动过状态机的事件值
+    last_event_id  TEXT,
+    last_event_time REAL,                        -- 最近事件的 event_time（epoch 秒）
+    last_transition TEXT,                        -- entered | cleared；尚无状态变化为 NULL
+    entered_at     TEXT,                         -- 最近一次进入告警的处理时间
+    cleared_at     TEXT,                         -- 最近一次解除告警的处理时间
+    updated_at     TEXT,
+    FOREIGN KEY (device_id) REFERENCES devices (device_id)
+);
+
+-- 状态转换流水：只追加。(device_id, event_id) 唯一约束兜底：
+-- 重试批次中的事件在 ingest 幂等去重阶段即被跳过，即使绕过也无法重复产生状态变化。
+CREATE TABLE IF NOT EXISTS device_alert_transitions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT NOT NULL,
+    event_id   TEXT NOT NULL,
+    event_time REAL NOT NULL,
+    value      REAL NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('entered', 'cleared')),
+    created_at TEXT NOT NULL,
+    UNIQUE (device_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_transitions_device
+    ON device_alert_transitions (device_id, id);
 """
 
 

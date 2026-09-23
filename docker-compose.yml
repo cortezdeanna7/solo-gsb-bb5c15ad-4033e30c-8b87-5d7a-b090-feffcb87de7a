@@ -1,6 +1,8 @@
 services:
   api:
     build: .
+    image: telemetry-api:latest
+    init: true
     ports:
       - "8000:8000"
     environment:
@@ -8,6 +10,7 @@ services:
     volumes:
       - telemetry-data:/data
     restart: unless-stopped
+    stop_grace_period: 10s
     healthcheck:
       # 仅依赖镜像自带的 Python，无需额外安装 curl/wget；失败时 docker ps 显示 unhealthy
       test:
